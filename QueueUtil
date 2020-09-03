@@ -1,0 +1,142 @@
+package com.xxxxxx.xxx.send.handle;
+import com.xxxxxx.xxx.ApplicationContextHolder;
+import com.xxxxxx.xxx.common.dictionary.DictTools;
+import com.xxxxxx.xxx.entity.ZzSmsSend;
+import com.xxxxxx.xxx.vo.CacheDictVo;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.concurrent.BasicThreadFactory;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author pengkai
+ * @date 2020/6/17
+ */
+@Component
+@Slf4j
+public class SmsQueueUtil {
+    /**
+     * 打包jvm队列
+     */
+    private static final Map<ReqAndChannel, QueueHandle> SMS_QUEUE_MAP = new HashMap<>();
+    /**
+     * 同步锁
+     */
+    private static volatile Object LOCK = new Object();
+
+    /**
+     * 定时任务线程锁
+     */
+    private static final ScheduledExecutorService executorService = new ScheduledThreadPoolExecutor(1, new BasicThreadFactory.Builder().namingPattern("sms-queue-schedule-%d").daemon(true).build());
+
+    @PostConstruct
+    public void init() {
+        startTimer();
+        registShutdown();
+    }
+    
+    /**
+     * 入口方法
+     * ZzSmsSend实体参数
+     *
+     */
+    public void push(ZzSmsSend zzSmsSend) {
+        ZxSmsSend zxSmsSend = new ZxSmsSend(zzSmsSend.getUserid(),zzSmsSend.getRequestType().getChannelCode(),zzSmsSend.getChannel().getSmsChannel());
+        getSmsQueue(zxSmsSend).push(zzSmsSend);
+    }
+
+    private void startTimer() {
+        executorService.scheduleWithFixedDelay(() -> excuteBatchSend(), 1000, 300000, TimeUnit.MILLISECONDS);
+    }
+
+    private void registShutdown(){
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> shutdownThreadPool(executorService)));
+    }
+
+    private void excuteBatchSend() {
+        if (SMS_QUEUE_MAP.isEmpty()) {
+            return;
+        }
+        SMS_QUEUE_MAP.entrySet().forEach(entry -> entry.getValue().sendBatch());
+    }
+
+    private QueueHandle getSmsQueue(ZxSmsSend zxSmsSend) {
+        ReqAndChannel reqAndChannel = new ReqAndChannel(zxSmsSend.getUserId(), zxSmsSend.getReqType(), zxSmsSend.getChannel());
+        QueueHandle queueHandle = SMS_QUEUE_MAP.get(reqAndChannel);
+        if (queueHandle == null) {
+            synchronized (LOCK) {
+                queueHandle = SMS_QUEUE_MAP.get(reqAndChannel);
+                if (queueHandle == null) {
+                    queueHandle = ApplicationContextHolder.getBean(QueueHandle.class);
+                    SMS_QUEUE_MAP.put(reqAndChannel, queueHandle);
+                }
+            }
+        }
+        return queueHandle;
+    }
+
+    /**
+     * 优雅关闭线程池
+     * @param threadPool
+     */
+    private void shutdownThreadPool(ExecutorService threadPool) {
+        threadPool.shutdown();
+        try {
+            // 等待未完成任务结束
+            if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)) {
+                threadPool.shutdownNow(); // 取消当前执行的任务
+                log.warn("Interrupt the worker, which may cause some task inconsistent. Please check the biz logs.");
+
+                // 等待任务取消的响应
+                if (!threadPool.awaitTermination(60, TimeUnit.SECONDS)){
+                    log.error("Thread pool can't be shutdown even with interrupting worker threads, which may cause some task inconsistent. Please check the biz logs.");
+                }
+            }
+        } catch (InterruptedException ie) {
+            threadPool.shutdownNow();
+            log.error("The current server thread is interrupted when it is trying to stop the worker threads. This may leave an inconcistent state. Please check the biz logs.");
+            // 保留中断状态
+            Thread.currentThread().interrupt();
+        }
+
+        log.info("Finally shutdown the thead pool: {}");
+    }
+
+    public class ReqAndChannel {
+        private String userId;
+        private String reqtype;
+        private int channel;
+
+        public ReqAndChannel(String userId, String reqtype, int channel) {
+            this.userId = userId;
+            this.reqtype = reqtype;
+            this.channel = channel;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof ReqAndChannel)) {
+                return false;
+            }
+            ReqAndChannel that = (ReqAndChannel) o;
+            return reqtype == that.reqtype &&
+                    channel == that.channel;
+        }
+
+        @Override
+        public int hashCode() {
+
+            return Objects.hash(reqtype, channel);
+        }
+    }
+}
